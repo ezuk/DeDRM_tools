@@ -131,8 +131,20 @@ class InterfacePluginAction(InterfaceAction):
             showErrorDlg(msg, None)
             return
 
+        # Build a set of lowercased titles already in calibre library
+        calibre_titles = set()
+        try:
+            for book_id in self.db.all_book_ids():
+                title = self.db.field_for('title', book_id)
+                if title:
+                    calibre_titles.add(title.lower())
+        except Exception:
+            debug_print("Failed to retrieve calibre library titles")
+            calibre_titles = set()
+
         # Launch the Dialog so the user can select titles.
-        dlg = SelectionDialog(self.gui, self, books)
+        from calibre_plugins.obok_dedrm.config import plugin_prefs
+        dlg = SelectionDialog(self.gui, self, books, plugin_prefs, calibre_titles)
         if dlg.exec_():
             books_to_import = dlg.getBooks()
             self.count = len(books_to_import)
