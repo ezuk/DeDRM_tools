@@ -24,6 +24,7 @@ try:
 except ImportError:
         from PyQt4.QtGui import (QListWidget, QAbstractItemView)
 
+from calibre.constants import DEBUG
 from calibre.gui2 import gprefs, warning_dialog, error_dialog
 from calibre.gui2.dialogs.message_box import MessageBox
 
@@ -34,6 +35,7 @@ from calibre_plugins.obok_dedrm.utilities import (SizePersistedDialog, ImageTitl
                                         )
 from calibre_plugins.obok_dedrm.__init__ import (PLUGIN_NAME,  
                         PLUGIN_SAFE_NAME, PLUGIN_VERSION, PLUGIN_DESCRIPTION)
+from calibre_plugins.obok_dedrm.title_match import LibraryMatcher, title_keys
 
 try:
     debug_print("obok::dialogs.py - loading translations")
@@ -46,13 +48,13 @@ class SelectionDialog(SizePersistedDialog):
     '''
     Dialog to select the kobo books to decrypt
     '''
-    def __init__(self, gui, interface_action, books, plugin_prefs, calibre_titles=None):
+    def __init__(self, gui, interface_action, books, plugin_prefs, matcher=None):
         '''
         :param gui: Parent gui
         :param interface_action: InterfaceActionObject (InterfacePluginAction class from action.py)
         :param books: list of Kobo book
         :param plugin_prefs: JSONConfig plugin preferences (for persisting hidden books)
-        :param calibre_titles: set of lowercased titles already in calibre library
+        :param matcher: LibraryMatcher over titles already in the calibre library
         '''
 
         self.books = books
@@ -60,8 +62,21 @@ class SelectionDialog(SizePersistedDialog):
         self.interface_action = interface_action
         self.plugin_prefs = plugin_prefs
         self.hidden_book_ids = set(plugin_prefs.get('hidden_books', []))
-        self.calibre_titles = calibre_titles if calibre_titles is not None else set()
-        self.filter_in_library = False
+        self.matcher = matcher if matcher is not None else LibraryMatcher([])
+        # Default to the import-eligible diff (books not yet in calibre); the
+        # 'Not in Library' button below is checked to match this on open.
+        self.library_filter_mode = 'not_in'  # None | 'in' | 'not_in'
+
+        # Precompute, once, which Kobo books are already in the calibre library.
+        # Done here -- not in apply_filters -- so the fuzzy scan does not re-run
+        # on every keystroke / filter toggle.
+        self.in_library_ids = set()
+        for book in self.books:
+            if self.matcher.match(book.title, book.author) is not None:
+                self.in_library_ids.add(book.volumeid)
+
+        if DEBUG:
+            self._log_match_diagnostics()
 
         SizePersistedDialog.__init__(self, gui, PLUGIN_NAME + 'plugin:selections dialog')
         self.setWindowTitle(_(PLUGIN_NAME + ' v' + PLUGIN_VERSION))
@@ -112,9 +127,14 @@ class SelectionDialog(SizePersistedDialog):
         self.show_hidden_button.setToolTip(_("Show all previously hidden books."))
         self.show_hidden_button.clicked.connect(self._show_hidden_clicked)
         self.in_library_button = button_box.addButton(_("In Library"), QDialogButtonBox.ResetRole)
-        self.in_library_button.setToolTip(_("Toggle: show only books whose titles are already in your calibre library."))
+        self.in_library_button.setToolTip(_("Toggle: show only books already in your calibre library."))
         self.in_library_button.setCheckable(True)
         self.in_library_button.clicked.connect(self._in_library_clicked)
+        self.not_in_library_button = button_box.addButton(_("Not in Library"), QDialogButtonBox.ResetRole)
+        self.not_in_library_button.setToolTip(_("Toggle: show only books NOT yet in your calibre library (eligible to import)."))
+        self.not_in_library_button.setCheckable(True)
+        self.not_in_library_button.clicked.connect(self._not_in_library_clicked)
+        self.not_in_library_button.setChecked(True)  # default view: not-in-library
         layout.addWidget(button_box)
 
         # Cause our dialog size to be restored from prefs or created on first usage
@@ -122,13 +142,55 @@ class SelectionDialog(SizePersistedDialog):
         self.books_table.populate_table(self.books)
         self._apply_filters()
 
+    def _log_match_diagnostics(self):
+        '''
+        Verbose in-library match breakdown. Only called when calibre is run with
+        DEBUG on (e.g. ``calibre-debug -g``); silent and skipped in normal use.
+        '''
+        in_lib_exact = in_lib_approx = 0
+        author_mismatch = []
+        for book in self.books:
+            hit = self.matcher.match(book.title, book.author)
+            if hit is not None:
+                if hit in title_keys(book.title):
+                    in_lib_exact += 1
+                else:
+                    in_lib_approx += 1
+                    debug_print("OBOK DIAG: approximate in-library match: %r (%r) ~= calibre %r"
+                                % (book.title, book.author, hit))
+            elif self.matcher.title_exists(book.title):
+                # Title is in the library but the author didn't match: the
+                # author-first gate is treating it as a different book.
+                author_mismatch.append((book.title, book.author))
+        debug_print("OBOK DIAG: %d Kobo books; in-library exact=%d approx=%d; not-in-library=%d"
+                    % (len(self.books), in_lib_exact, in_lib_approx,
+                       len(self.books) - len(self.in_library_ids)))
+        if author_mismatch:
+            debug_print("OBOK DIAG: %d not-in-library books whose TITLE exists under a different author:"
+                        % len(author_mismatch))
+            for t, a in author_mismatch[:15]:
+                debug_print("OBOK DIAG:   author-mismatch: %r (Kobo author: %r)" % (t, a))
+
     def _apply_filters(self):
         search_text = self.search_box.text().lower()
         self.books_table.apply_filters(search_text, self.hidden_book_ids,
-                                       self.filter_in_library, self.calibre_titles)
+                                       self.library_filter_mode, self.in_library_ids)
 
     def _in_library_clicked(self):
-        self.filter_in_library = self.in_library_button.isChecked()
+        # 'In Library' and 'Not in Library' are mutually exclusive views.
+        if self.in_library_button.isChecked():
+            self.not_in_library_button.setChecked(False)
+            self.library_filter_mode = 'in'
+        else:
+            self.library_filter_mode = None
+        self._apply_filters()
+
+    def _not_in_library_clicked(self):
+        if self.not_in_library_button.isChecked():
+            self.in_library_button.setChecked(False)
+            self.library_filter_mode = 'not_in'
+        else:
+            self.library_filter_mode = None
         self._apply_filters()
 
     def _save_hidden_books(self):
@@ -285,8 +347,8 @@ class BookListTableWidget(QTableWidget):
         for row in range(self.rowCount()):
             self.item(row, 0).setCheckState(Qt.Unchecked)
 
-    def apply_filters(self, search_text, hidden_book_ids, filter_in_library=False, calibre_titles=None):
-        calibre_titles = calibre_titles or set()
+    def apply_filters(self, search_text, hidden_book_ids, library_filter_mode=None, in_library_ids=None):
+        in_library_ids = in_library_ids or set()
         for row in range(self.rowCount()):
             volumeid = self.item(row, 0).data(Qt.UserRole)
             title_lower = self.item(row, 2).data(Qt.UserRole)
@@ -299,7 +361,13 @@ class BookListTableWidget(QTableWidget):
                 search_text not in series_text
             )
             hidden_by_user = volumeid in hidden_book_ids
-            hidden_by_library = filter_in_library and (title_lower not in calibre_titles)
+            in_lib = volumeid in in_library_ids
+            if library_filter_mode == 'in':
+                hidden_by_library = not in_lib
+            elif library_filter_mode == 'not_in':
+                hidden_by_library = in_lib
+            else:
+                hidden_by_library = False
 
             self.setRowHidden(row, hidden_by_search or hidden_by_user or hidden_by_library)
 
